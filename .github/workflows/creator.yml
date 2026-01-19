@@ -1,0 +1,271 @@
+name: CREATOR CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  update-organization-readme:
+    name: Update organization README
+    if: github.repository == 'creatorsim/creator'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Repo
+        uses: actions/checkout@v4
+      - name: Check for README changes
+        uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            readme:
+              - 'README.md'
+      - name: Checkout Destination Repo
+        if: steps.filter.outputs.readme == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: creatorsim/.github 
+          path: destination-repo
+          token: ${{ secrets.API_TOKEN_GITHUB }} 
+      - name: Copy README
+        if: steps.filter.outputs.readme == 'true'
+        run: |
+          mkdir -p destination-repo/profile
+          cp README.md destination-repo/profile/README.md
+      - name: Push changes to .github repo
+        if: steps.filter.outputs.readme == 'true'
+        run: |
+          cd destination-repo
+          git config user.name "README-Sync-Bot"
+          git config user.email "actions@github.com"
+          git add profile/README.md
+          if git diff --staged --quiet; then
+            echo "No changes detected in README"
+          else
+            git commit -m "Auto-update profile README from project source"
+            git push
+          fi
+          
+  build-web:
+    name: Build CREATOR web
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        uses: ./.github/actions/dependencies
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            creator-assembler/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('creator-assembler/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Build assembler web
+        env:
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          bun build:web
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist/web/creator/
+
+  build-cli-wasm:
+    name: Build CREATOR cli WASM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        uses: ./.github/actions/dependencies
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            creator-assembler/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('creator-assembler/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Build assembler cli
+        run: bun wasm:cli
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-artifact
+          path: src/core/assembler/creatorAssembler/deno/wasm/
+
+  build-cli-binaries:
+    name: Build CLI (${{ matrix.os }})
+    runs-on: ubuntu-latest
+    needs: build-cli-wasm
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows
+          - target: x86_64-apple-darwin
+            os: mac-x64
+          - target: aarch64-apple-darwin
+            os: mac-arm
+          - target: x86_64-unknown-linux-gnu
+            os: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: linux-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download WASM
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-artifact
+          path: src/core/assembler/creatorAssembler/deno/wasm/
+      - name: Install CLI dependencies
+        uses: ./.github/actions/cli-dependencies
+      - name: Cache Deno
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/deno
+            ~/.deno
+          key: ${{ runner.os }}-deno-${{ matrix.target }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-${{ matrix.target }}-
+      - name: Build cli binary
+        env:
+          PAGE: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          CREATOR_CHANNEL: nightly
+          CREATOR_COMMIT: ${{ github.sha }}
+        run: ./scripts/build-cli.sh -o creator-cli-${{ matrix.os }} -t ${{ matrix.target }}
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: creator-cli-${{ matrix.os }}
+          path: creator-cli-${{ matrix.os }}*
+          if-no-files-found: error
+
+  package-architectures:
+    name: Package architectures
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Package architectures
+        env:
+          PAGE: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: |
+          sed --in-place --expression 's\^# yaml-language-server: $schema=.*.json\# yaml-language-server: $schema='"$PAGE"'/schema/architecture.json\' architecture/*.yml architecture/**/*.yml
+          zip --recurse-paths --include '*.yml' --junk-paths architectures.zip architecture/
+      - name: Upload architectures
+        uses: actions/upload-artifact@v4
+        with:
+          name: architectures
+          path: architectures.zip
+          if-no-files-found: error
+
+  test:
+    name: Run CREATOR tests
+    runs-on: ubuntu-latest
+    needs: build-cli-wasm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Download WASM
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-artifact
+          path: src/core/assembler/creatorAssembler/deno/wasm/
+      - name: Install dependencies
+        uses: ./.github/actions/dependencies
+      - name: Run tests
+        run: deno test -A --unstable-node-globals --parallel --ignore=tests/unit/core/executor/decoder/
+
+  publish-nightly:
+    name: Publish nightly release
+    runs-on: ubuntu-latest
+    needs: [build-cli-binaries, package-architectures, test]
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Delete nightly tag
+        run: gh release delete nightly --cleanup-tag || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish nightly release
+        run: |
+          gh release create nightly artifacts/creator-cli-* artifacts/architectures.zip \
+            --title "Nightly release" \
+            --prerelease \
+            --target ${{ github.sha }} \
+            --notes "Nightly build from commit ${{ github.sha }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-stable:
+    name: Publish latest tagged release
+    runs-on: ubuntu-latest
+    needs: [build-cli-binaries, package-architectures, test]
+    if: github.ref_type == 'tag'
+    concurrency:
+      group: stable-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish latest release
+        run: |
+          gh release create ${{ github.ref_name }} artifacts/creator-cli-* artifacts/architectures.zip \
+            --generate-notes \
+            --latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-pages:
+    name: Deploy CREATOR to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: [build-web, test]
+    if: github.event_name != 'pull_request'
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      pages: write # to deploy to Pages
+      id-token: write # to verify the deployment originates from an appropriate source
+    # Deploy to the github-pages environment
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4

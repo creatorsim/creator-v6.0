@@ -1,0 +1,3 @@
+[submodule "creator-assembler"]
+	path = creator-assembler
+	url = https://github.com/creatorsim/creator-assembler.git
